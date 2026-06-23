@@ -1,0 +1,31 @@
+# ============================================================
+# Qwen 微调工具箱 依赖（WSL/Linux + NVIDIA CUDA）
+# 注意：
+#  1) torch 由 setup.sh 单独从 CUDA wheel 源安装，不在此文件内，避免拉到 CPU 版本。
+#  2) LLaMA-Factory 由 setup.sh 从 GitHub 源码安装（PyPI 0.9.3 太旧、不支持 Qwen3.5）。
+#     源码版会自动带入 transformers 5.x 等兼容依赖。
+# ============================================================
+
+# 锁定 transformers 到既能跑 Qwen3.5(model_type=qwen3_5，需 >=5.3.0)
+# 又被 LLaMA-Factory 源码支持(<=5.6.0)的区间，确保新模型可加载。
+transformers>=5.3.0,<=5.6.0
+
+# 新版 LLaMA-Factory 不再提供 extras，以下原 extras 依赖改为显式安装：
+# QLoRA(4/8bit 量化训练)所需
+bitsandbytes>=0.43.0
+# 评测指标(BLEU/ROUGE，启用 predict_with_generate 时需要)
+nltk>=3.8
+jieba>=0.42.1
+rouge-chinese>=1.0.3
+
+# 模型/数据集来源
+modelscope>=1.20.0
+huggingface_hub>=0.27.0
+datasets>=3.0.0
+
+# 交互式 CLI 体验
+rich>=13.0.0
+questionary>=2.0.0
+python-dotenv>=1.0.0
+PyYAML>=6.0
+requests>=2.31.0

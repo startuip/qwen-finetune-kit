@@ -1,0 +1,24 @@
+# 虚拟环境
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# 用户运行时数据 —— 分享项目时不包含模型/数据/产物
+models/*
+data/*
+output/*
+configs/*
+
+# 但保留目录占位与示例
+!models/.gitkeep
+!data/.gitkeep
+!output/.gitkeep
+!configs/.gitkeep
+
+# 本地环境变量（含个人配置/令牌）
+.env
+
+# 缓存
+.cache/
+*.log
