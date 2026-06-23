@@ -26,6 +26,11 @@ def chat() -> bool:
         "finetuning_type": "lora",
         "trust_remote_code": True,
         "infer_backend": "huggingface",
+        # 4-bit 加载：4B 模型在 6GB 显存下若用 bf16 会被 accelerate 下放到 CPU，
+        # 触发 peft.load_adapter → accelerate.get_balanced_memory 的
+        # "unhashable type: 'set'" 兼容 bug。量化后整模放进单卡即可绕过，
+        # 且与 QLoRA 训练设置一致。显存充足可在 infer.yaml 里把它删掉。
+        "quantization_bit": 4,
     }
     cfg_path = config.CONFIGS_DIR / "infer.yaml"
     cfg_path.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False),
