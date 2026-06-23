@@ -5,15 +5,16 @@
   → 写 Modelfile（FROM . + Qwen ChatML 模板）
   → ollama create <name> -f Modelfile --quantize q4_K_M
 
-回退路径（当 Ollama 不支持该架构直导 safetensors 时）：
-  clone+build llama.cpp → convert_hf_to_gguf.py → llama-quantize → Modelfile(FROM gguf)
-  → ollama create
+回退路径（当 Ollama 自带转换器不支持该架构、直导 safetensors 失败时）：
+  clone 最新 llama.cpp → convert_hf_to_gguf.py（仅 Python，无需编译）→ f16 GGUF
+  → Modelfile(FROM gguf) → ollama create --quantize（量化交给 Ollama）
 """
 from __future__ import annotations
 
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -47,6 +48,13 @@ def _merge_lora() -> Optional[Path]:
         return None
 
     merged_dir = Path(str(adapter) + "-merged")
+    # 已有完整合并结果则可复用，避免重复合并 4B 模型（耗时）
+    if merged_dir.exists() and list(merged_dir.glob("*.safetensors")):
+        if ui.ask_confirm(f"检测到已合并模型 {merged_dir.name}，直接复用？", default=True):
+            ui.ok(f"复用已合并模型: {merged_dir}")
+            config.update_state(last_merged_dir=str(merged_dir))
+            return merged_dir
+
     cfg = {
         "model_name_or_path": str(base),
         "adapter_name_or_path": str(adapter),
@@ -112,49 +120,61 @@ def _smoke_test(name: str) -> None:
 # ------------------------------------------------------------------
 # 回退路径：llama.cpp
 # ------------------------------------------------------------------
-def _fallback_llamacpp(merged_dir: Path, name: str) -> bool:
-    ui.title("回退路径：通过 llama.cpp 转 GGUF")
-    if not ui.ask_confirm("Ollama 直导失败，尝试用 llama.cpp 转换？（需 git/cmake/编译，耗时较长）",
-                          default=True):
-        return False
-    for tool in ("git", "cmake"):
-        if shutil.which(tool) is None:
-            ui.err(f"缺少 {tool}，请先安装：sudo apt install -y git cmake build-essential")
-            return False
+def _fallback_llamacpp(merged_dir: Path, name: str, quant_arg: Optional[str]) -> bool:
+    """用最新 llama.cpp 的 Python 转换脚本把 merged safetensors 转成 f16 GGUF，
+    再交给 Ollama 量化/导入。
 
-    lc = config.ROOT / ".cache" / "llama.cpp"
+    关键点：
+    - Ollama 自带的转换器较旧，搞不定 Qwen3.5(qwen3_5) 新架构（报 unexpected EOF）；
+      但 llama.cpp master 已支持，且 Ollama 运行时能跑 qwen3_5 的 GGUF。
+    - 只需 Python 脚本，无需 cmake 编译（量化交给 Ollama --quantize）。
+    - 不动 venv 里的 transformers/torch，只补装轻量的 gguf 包。
+    - Qwen3.5 含 MTP 头，转换加 --no-mtp 只导出主干（普通对话不需要投机解码草稿）。
+    """
+    ui.title("回退路径：用 llama.cpp 转 GGUF 再导入 Ollama")
+    if shutil.which("git") is None:
+        ui.err("缺少 git，请先安装：sudo apt install -y git")
+        return False
+    if not ui.ask_confirm("克隆 llama.cpp 并转换为 GGUF？（仅 Python，无需编译）", default=True):
+        return False
+
+    lc = config.CACHE_DIR / "llama.cpp"
     if not lc.exists():
-        ui.info("克隆 llama.cpp ...")
+        ui.info("克隆 llama.cpp（master，含 qwen3_5 支持）...")
         if subprocess.run(["git", "clone", "--depth", "1",
                            "https://github.com/ggml-org/llama.cpp", str(lc)]).returncode != 0:
             ui.err("克隆失败。")
             return False
-    quant_bin = lc / "build" / "bin" / "llama-quantize"
-    if not quant_bin.exists():
-        ui.info("编译 llama.cpp（首次较慢）...")
-        subprocess.run(["cmake", "-B", "build"], cwd=str(lc))
-        subprocess.run(["cmake", "--build", "build", "--config", "Release", "-j"], cwd=str(lc))
+    else:
+        subprocess.run(["git", "-C", str(lc), "pull", "--ff-only"], check=False)
 
-    # 转换依赖
-    subprocess.run(["pip", "install", "-r", str(lc / "requirements.txt")], check=False)
+    # 仅补装转换所需的轻量包，避免动到 transformers/torch
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "gguf"], check=False)
 
     f16 = merged_dir / "model-f16.gguf"
-    ui.info("convert_hf_to_gguf.py → f16 GGUF ...")
-    conv = subprocess.run(
-        ["python", str(lc / "convert_hf_to_gguf.py"), str(merged_dir),
-         "--outfile", str(f16), "--outtype", "f16"]
-    )
+    conv_py = str(lc / "convert_hf_to_gguf.py")
+    base_cmd = [sys.executable, conv_py, str(merged_dir),
+                "--outfile", str(f16), "--outtype", "f16"]
+    ui.info("convert_hf_to_gguf.py → f16 GGUF（Qwen3.5 用 --no-mtp）...")
+    conv = subprocess.run(base_cmd + ["--no-mtp"])
+    if conv.returncode != 0:
+        # 旧脚本可能不认 --no-mtp，去掉重试一次
+        ui.warn("带 --no-mtp 转换失败，去掉该参数重试 ...")
+        conv = subprocess.run(base_cmd)
     if conv.returncode != 0 or not f16.exists():
-        ui.err("GGUF 转换失败：当前模型架构可能尚未被 llama.cpp 支持。")
-        ui.warn("建议：改用已被支持的模型（如 Qwen3 系列），或等待 llama.cpp 适配。")
+        ui.err("GGUF 转换失败：该模型架构可能仍未被 llama.cpp 支持，或为多模态导致。")
+        ui.warn("建议：① 升级/重拉 llama.cpp master 再试；② 改用纯文本/已支持模型（如 Qwen3 系列）。")
         return False
+    ui.ok(f"已生成 f16 GGUF: {f16}")
 
-    q4 = merged_dir / "model-q4_k_m.gguf"
-    if quant_bin.exists():
-        subprocess.run([str(quant_bin), str(f16), str(q4), "Q4_K_M"], check=False)
-    target_gguf = q4 if q4.exists() else f16
-    mf = _write_modelfile(f"./{target_gguf.name}", merged_dir)
-    return _ollama_create(name, mf, quantize=None)
+    # 交给 Ollama：先尝试带量化导入，失败再原样导入 f16
+    mf = _write_modelfile(f"./{f16.name}", merged_dir)
+    if _ollama_create(name, mf, quantize=quant_arg):
+        return True
+    if quant_arg is not None:
+        ui.warn("带量化导入失败，改为直接导入 f16 GGUF（体积较大）...")
+        return _ollama_create(name, mf, quantize=None)
+    return False
 
 
 # ------------------------------------------------------------------
@@ -186,7 +206,7 @@ def export_to_ollama() -> bool:
 
     # 回退路径
     ui.warn("主路径失败，转入 llama.cpp 回退路径。")
-    if _fallback_llamacpp(merged, name):
+    if _fallback_llamacpp(merged, name, quant_arg):
         ui.ok(f"✅ 经 llama.cpp 已导入 Ollama：{name}")
         config.update_state(last_ollama_name=name)
         _smoke_test(name)
